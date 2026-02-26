@@ -307,3 +307,162 @@ modulo_adder = self._double_controlled_phi_add_mod_N(
 - **Reversible computation**: Each addition can be undone for uncomputation
 - **Quantum efficiency**: Uses QFT-based addition for logarithmic depth
 - **Double control**: Enables precise control over when additions occur
+
+Awesome—let’s write the action of each block as clean state-transform formulas.
+Registers:
+
+* $c$ = control qubit (`ctrl`)
+* $x=x_{n-1}\ldots x_0$ = multiplicand register (`x`)
+* $b=b_{n}\ldots b_0$ = accumulator register (`b`, size $n{+}1$)
+* $f$ = overflow flag (`flag`)
+
+Assume arithmetic is mod $N$. In your use, $b$ usually starts at $|0\rangle$.
+
+---
+
+### 0) Start
+
+$$
+|c\rangle\,|x\rangle\,|b\rangle\,|f\rangle
+$$
+
+---
+
+### 1) `circuit.append(qft, b_qreg)`
+
+Basis change for the adder workspace (no arithmetic yet):
+
+$$
+|c\rangle\,|x\rangle\,\mathrm{QFT}|b\rangle\,|f\rangle
+$$
+
+---
+
+### 2) Loop of controlled φ-adders
+
+```python
+for i in range(n):
+    append_adder(modulo_adder, a, i)   # adds (2^i * a) if x_i = 1 and c = 1
+```
+
+Each **double-controlled modular φ-adder** implements, in net computational effect:
+
+$$
+|c\rangle\,|x\rangle\,|b\rangle\,|f\rangle
+\;\longmapsto\;
+|c\rangle\,|x\rangle\,|\,b + c\cdot x_i\cdot(2^i a)\;(\mathrm{mod}\;N)\rangle\,|f\rangle .
+$$
+
+After all $i$ have been applied:
+
+$$
+|c\rangle\,|x\rangle\,|\,b + c\cdot (a\cdot x)\;(\mathrm{mod}\;N)\rangle\,|f\rangle .
+$$
+
+(The flag $f$ is toggled internally to handle the “$\bmod N$” reduction, but it is returned to its initial value by the adder block itself.)
+
+---
+
+### 3) `circuit.append(iqft, b_qreg)`
+
+Return the adder to the computational basis:
+
+$$
+|c\rangle\,|x\rangle\,|\,b + c\cdot (a\cdot x)\;(\mathrm{mod}\;N)\rangle\,|f\rangle .
+$$
+
+---
+
+### 4) Conditional swap ladder
+
+```python
+for i in range(n):
+    circuit.cswap(ctrl_qreg, x_qreg[i], b_qreg[i])
+```
+
+Bitwise, if $c=1$ swap $x_i \leftrightarrow b_i$; if $c=0$ do nothing. Compactly:
+
+$$
+|c\rangle\,|x\rangle\,|b'\rangle
+\;\longmapsto\;
+|c\rangle\,|\, (1\!-\!c)\,x + c\,b' \rangle \;|\, (1\!-\!c)\,b' + c\,x \rangle ,
+$$
+
+where $b' = b + c\cdot (a x)\ (\!\bmod N)$.
+If $b$ started at $0$:
+
+* When $c=1$: $|1\rangle\,|x\rangle\,|a x\rangle \mapsto |1\rangle\,|a x\rangle\,|x\rangle$
+* When $c=0$: unchanged.
+
+So the **product $(a\cdot x)\bmod N$** now sits in the $x$-register when $c=1$.
+
+---
+
+### 5) `circuit.append(qft, b_qreg)`
+
+Prepare to uncompute the workspace:
+
+$$
+|c\rangle\,|\,x_{\mathrm{out}}\rangle\,\mathrm{QFT}|\,b_{\mathrm{gar}}\rangle\,|f\rangle,
+$$
+
+where $x_{\mathrm{out}} = (a x)\bmod N$ if $c{=}1$, else $x$; and $b_{\mathrm{gar}}$ is the swapped-over old $x$ (or $b$ if $c{=}0$).
+
+---
+
+### 6) Inverse adders with $a^{-1}$
+
+```python
+a_inv = a^{-1} (mod N)
+modulo_adder_inv = modulo_adder.inverse()
+for i in reversed(range(n)):
+    append_adder(modulo_adder_inv, a_inv, i)
+```
+
+Net effect of the full inverse-adder sweep:
+
+$$
+|c\rangle\,|x_{\mathrm{out}}\rangle\,|b_{\mathrm{gar}}\rangle\,|f\rangle
+\;\longmapsto\;
+|c\rangle\,|x_{\mathrm{out}}\rangle\,|\,b_{\mathrm{gar}} - c\cdot(a^{-1}\!\cdot x_{\mathrm{gar}})\;(\mathrm{mod}\;N)\rangle\,|f\rangle .
+$$
+
+Here $x_{\mathrm{gar}}$ is exactly the value that had been accumulated before the cswaps (it’s the thing now living in $b$ after the swaps).
+If $b$ originally started at $0$, then with $c{=}1$ we have $b_{\mathrm{gar}}=x$, hence:
+
+$$
+|1\rangle\,|x_{\mathrm{out}}\rangle\,|x\rangle \;\mapsto\; |1\rangle\,|x_{\mathrm{out}}\rangle\,|\,x - a^{-1}x\;(\mathrm{mod}\;N)\rangle = |1\rangle\,|x_{\mathrm{out}}\rangle\,|0\rangle .
+$$
+
+So the **workspace is cleaned back to $|0\dots 0\rangle$**.
+
+---
+
+### 7) `circuit.append(iqft, b_qreg)`
+
+Return the cleaned workspace to computational basis (it is already $|0\rangle$; this just closes the adder gadget):
+
+$$
+|c\rangle\,|x_{\mathrm{out}}\rangle\,|0\rangle\,|f\rangle .
+$$
+
+---
+
+## Overall mapping of the instruction
+
+With $b$ initialized to $|0\rangle$ and $f$ reset:
+
+$$
+\boxed{\
+|c\rangle\,|x\rangle\,|0\rangle\,|0\rangle
+\;\longmapsto\;
+|c\rangle\,|\, (1\!-\!c)\,x + c\,(a x \bmod N) \rangle\,|0\rangle\,|0\rangle
+}
+$$
+
+So:
+
+* If $c=0$: $|0\rangle|x\rangle|0\rangle \mapsto |0\rangle|x\rangle|0\rangle$ (do nothing).
+* If $c=1$: $|1\rangle|x\rangle|0\rangle \mapsto |1\rangle|a x\bmod N\rangle|0\rangle$ (multiply $x$ by $a$ mod $N$), with all ancillas clean.
+
+That matches exactly what your `cmult_{label}_mod_N` is designed to implement.
